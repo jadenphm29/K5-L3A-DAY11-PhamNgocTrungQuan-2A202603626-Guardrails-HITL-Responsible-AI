@@ -42,6 +42,14 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+import unicodedata
+
+def _remove_accents(text: str) -> str:
+    """Normalize and remove Vietnamese diacritics for topic matching."""
+    nfkd = unicodedata.normalize('NFKD', text)
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).replace('đ', 'd').replace('Đ', 'D')
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -51,27 +59,42 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
+    if not user_input:
+        return "ALLOW"
+
+    # Canonicalize Unicode and strip invisible characters / zero-width spaces
+    cleaned = re.sub(
+        r"[\u200b-\u200f\u2028-\u202f\ufeff\u00ad\x00-\x08\x0b\x0c\x0e-\x1f]",
+        "",
+        user_input,
+    )
+    normalized = re.sub(r"\s+", " ", cleaned).strip()
+
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        # Instruction override / ignore
+        r"(?i)\bignore\s+(all\s+)?(previous|above|prior|past)\s+(instructions|prompts|rules|commands|constraints)\b",
+        r"(?i)\bdisregard\s+(all\s+)?(previous|above|prior)\s+(instructions|prompts|rules)\b",
+        # Roleplay / persona change
+        r"(?i)\byou\s+are\s+now\b",
+        r"(?i)\bpretend\s+(you\s+are|to\s+be)\b",
+        r"(?i)\b(act|behave)\s+as\s+(a\s+|an\s+)?(unrestricted|jailbroken|dan|root|admin|developer|evil)\b",
+        # System prompt leakage
+        r"(?i)\b(reveal|show|display|print|leak|repeat|output|disclose|give|tell)\s+(me\s+)?(all\s+)?(the\s+|your\s+)?(system\s+prompt|internal\s+instructions|system\s+instructions|hidden\s+instructions|initial\s+prompt|internal\s+password|admin\s+password)\b",
+        r"(?i)\bwhat\s+(is|was|were)\s+your\s+(original\s+|system\s+|initial\s+)?(prompt|instructions)\b",
+        r"(?i)\bsystem\s+prompt\b",
+        r"(?i)\breveal\s+(your\s+|the\s+)?(instructions|prompt)\b",
+        # Credential extraction attempts
+        r"(?i)\b(reveal|show|display|tell|give)\s+(me\s+)?(the\s+)?(admin\s+|internal\s+)?(password|api[_\s-]?key|secret|credentials|db[_\s-]?host)\b",
     ]
 
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, normalized):
             return "BLOCK"
     return "ALLOW"
 
 
 # ============================================================
 # Implement topic_filter()
-#
-# Check if user_input belongs to allowed topics.
-# The VinBank agent should only answer about: banking, account,
-# transaction, loan, interest rate, savings, credit card.
-#
-# Return ``"BLOCK"`` if input should be blocked (off-topic / blocked topic).
-# Return ``"ALLOW"`` if banking-related and OK.
 # ============================================================
 
 def topic_filter(user_input: str) -> InputStatus:
@@ -84,25 +107,43 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
+    if not user_input:
+        return "BLOCK"
+
     input_lower = user_input.lower()
+    input_no_accents = _remove_accents(input_lower)
 
-    # TODO: Implement logic:
     # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    for topic in BLOCKED_TOPICS:
+        t_pattern = rf"\b{re.escape(topic.lower())}"
+        if re.search(t_pattern, input_lower) or re.search(t_pattern, input_no_accents):
+            return "BLOCK"
 
-    pass  # Replace with your implementation
+    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
+    has_allowed = False
+    for topic in ALLOWED_TOPICS:
+        t_lower = topic.lower()
+        t_no_acc = _remove_accents(t_lower)
+        # Check either exact phrase or word boundary
+        if " " in t_lower:
+            if t_lower in input_lower or t_no_acc in input_no_accents:
+                has_allowed = True
+                break
+        else:
+            t_pattern = rf"\b{re.escape(t_lower)}"
+            if re.search(t_pattern, input_lower) or re.search(t_pattern, input_no_accents):
+                has_allowed = True
+                break
+
+    if not has_allowed:
+        return "BLOCK"
+
+    # 3. Otherwise -> return "ALLOW"
+    return "ALLOW"
 
 
 # ============================================================
 # Implement InputGuardrailPlugin
-#
-# This plugin blocks bad input BEFORE it reaches the LLM.
-# Fill in the on_user_message_callback method.
-#
-# NOTE: The callback uses keyword-only arguments (after *).
-#   - user_message is types.Content (not str)
-#   - Return types.Content to block, or None to pass through
 # ============================================================
 
 class InputGuardrailPlugin(base_plugin.BasePlugin):
@@ -144,14 +185,19 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Yêu cầu bị từ chối do phát hiện dấu hiệu prompt injection hoặc vi phạm chính sách bảo mật."
+            )
 
-        pass  # Replace with your implementation
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Yêu cầu bị từ chối do nằm ngoài phạm vi hỗ trợ nghiệp vụ ngân hàng của VinBank."
+            )
+
+        return None
 
 
 # ============================================================
